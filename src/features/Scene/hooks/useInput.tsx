@@ -124,7 +124,7 @@ const useInput = (renderer: Texture) => {
     const handleDrawing = (event: MouseEvent): void => {
         if (!__editable.value && !__trash.value) {
             // Select texture
-            renderer.selectTexture(event.offsetX, event.offsetY, 1);
+            renderer.selectTexture(event.offsetX, event.offsetY);
         } else {
             if (!__ready.value || !_brush.value || !__drag.value && event.type === "mousemove") return;
             // TODO: make more dynamic way to do this

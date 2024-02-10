@@ -135,5 +135,5 @@ export type {
     TexturesMapping,
     RevisionAction,
     RevisionRecord,
-    Textures
+    Textures,
 }

@@ -137,6 +137,27 @@ const useTexture = (ctx: CanvasRenderingContext2D) => {
         return `${dx},${dy}-${layer}`;
     }
     /**
+     * Get the topmost pixel layer
+     */
+    const getTopLayer = (x: number, y: number, l: number): TextureObject | undefined => {
+        if (!pixels.get(ckey(x, y, l))) {
+            return pixels.get(ckey(x, y, l-1));
+        }
+       return getTopLayer(x, y, l+1);
+    }
+    /**
+     * Check rect collison of known pixel region
+     */
+    const inPixelRegion = (x: number, y: number, w: number, h: number, l: number): boolean => {
+        if (pixels.get(ckey(x, y, l))
+        || pixels.get(ckey(x+w, y, l))
+        || pixels.get(ckey(x+w, y+h, l))
+        || pixels.get(ckey(x, y+h, l))) {
+            return true;
+        }
+        return false;
+    }
+    /**
      * Add to pixels mapping for texture selection bounding box
      */
     const addPixels = (texture: TextureObject) => {
@@ -149,6 +170,7 @@ const useTexture = (ctx: CanvasRenderingContext2D) => {
     }
     const removePixels = (texture: TextureObject) => {
         const { l, w, h, dx, dy } = texture;
+        // if (!pixels.get(ckey(dx, dy, l))) return;
         for (let i = dx; i <= dx+w; i++) {
             for (let j = dy; j <= dy+h; j++) {
                 pixels.delete(ckey(i, j, l));
@@ -156,9 +178,11 @@ const useTexture = (ctx: CanvasRenderingContext2D) => {
         }
     }
     const addTexture = (src: string, name: string, clipping: boolean, x: number, y: number, w: number, h: number, sx = 0, sy = 0, l = 1): number[] => {
+        console.log(l)
         // Scaling and account for clipping if true
         const [dx, dy] = scaling(x, y, w, h, clipping, l);
-        if (posExists(dx, dy, l)) {
+        if (inPixelRegion(x, y, w, h, l)) {
+            // Recuriselvy move up layer if layer is already existing
             addTexture(src, name, clipping, dx, dy, w, h, sx, sy, l+1);
             return [];
         } else {
@@ -182,13 +206,18 @@ const useTexture = (ctx: CanvasRenderingContext2D) => {
         }
     }
     const removeTexture = (x: number, y: number, l = 1) => {
-        const key = ckey(x, y, l);
-        const texture = pixels.get(key)
-        if (!texture) return [];
-        const {dx, dy, w, h} = texture;
-        removePixels(texture);
-        delete mapping.value[ckey(dx, dy, l)];
-        clearCanvas(dx, dy, w, h);
+        if (pixels.get(ckey(x, y, l))) {
+            // Recuriselvy move up layer if layer is already existing
+            removeTexture(x, y, l+1);
+            return [];
+        } else {
+            const texture = pixels.get(ckey(x, y, l-1))
+            if (!texture) return [];
+            const {dx, dy, w, h} = texture;
+            delete mapping.value[ckey(dx, dy, l-1)];
+            removePixels(texture);
+            clearCanvas(dx, dy, w, h);
+        }
     }
     const undoRevision = () => {
         const action = revisions.value.pop();
@@ -211,14 +240,14 @@ const useTexture = (ctx: CanvasRenderingContext2D) => {
             texture.render();
         }
     }
-    const removeAllTexture = () =>{
+    const removeAllTexture = () => {
         mapping.value = {};
         clearCanvas(0, 0, ctx.canvas.width, ctx.canvas.height);
     }
-    const selectTexture = (x: number, y: number, l: number = 1) => {
+    const selectTexture = async (x: number, y: number, l: number = 1) => {
         if (!selector.value) {
-            // Check if texture exists in pixel boundings
-            selector.value = pixels.get(ckey(x, y, l));
+            // Check if texture exists in pixel boundings - at topmost layer
+            selector.value = getTopLayer(x, y, l);
             if (selector.value) {
                 document.getElementById(SCENE.CANVAS)!.style.cursor = 'move';
             }
@@ -228,15 +257,18 @@ const useTexture = (ctx: CanvasRenderingContext2D) => {
             // Remove old pixel boundings and position
             const {l, w, h, dx, dy} = texture;
             removePixels(texture);
+            // console.log(mapping.value[ckey(dx, dy, l)])
             delete mapping.value[ckey(dx, dy, l)];
-            clearCanvas(dx, dy, w, h);
-            // Add new pixel boundings and position
+            // Update object new location
             texture.dx = x;
             texture.dy = y;
-            addPixels(texture);
-            mapping.value[ckey(texture.dx, texture.dy , l)] = texture;
-            ctx.drawImage(texture.texture.canvas, texture.dx, texture.dy);
+            // Redraw canvas
+            clearCanvas(dx, dy, w, h);
+            ctx.drawImage(texture.texture.canvas, x, y);
             document.onmouseup = (e) => {
+                // Add new pixel boundings and position
+                addPixels(texture);
+                mapping.value[ckey(texture.dx, texture.dy, l)] = texture;
                 // Reset canvas cursor
                 document.onmouseup = null;
                 document.getElementById(SCENE.CANVAS)!.style.cursor = 'pointer';
