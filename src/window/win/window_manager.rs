@@ -184,7 +184,10 @@ impl<'a> WindowManagerBuilder<'a> {
         class.style = self.style;
         class.cbClsExtra = self.metadata;
         class.cbWndExtra = self.window_metadata;
-        // class.hbrBackground =;
+        // class.hbrBackground =
+        // class.hCursor =
+        // class.hIcon =
+        // class.lpfnWndProc =
         let atom = unsafe { RegisterClassA(&class) };
         assert!(
             atom != 0,
