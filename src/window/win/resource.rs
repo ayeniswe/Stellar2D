@@ -1,7 +1,8 @@
-use crate::utils::logger::Logger;
-
 use super::instance::Instance;
+use crate::utils::logger::Logger;
 use std::{
+    borrow::Cow,
+    fs::metadata,
     io::Write,
     ops::{BitAnd, BitOr},
     path::Path,
@@ -13,21 +14,22 @@ use windows::{
         UI::WindowsAndMessaging::*,
     },
 };
-#[derive(Default)]
-/// All resource types accepted
-///
-/// `WinOEM` corresponds to Windows OEM icons, bitmaps, and cursors
-///
-/// `WinIC` corresponds to Windows Standard icons and cursors
+
 enum ResourceName<'a> {
-    FilePath(&'a Path),
-    WinOEM(u32),
-    WinIC(PCWSTR),
+    File(&'a str),
+    /// Windows OEM Bitmaps
+    WinOBM(u32),
+    /// Windows OEM Icons
+    WinOIC(u32),
+    /// Windows OEM Cursors
+    WinOCR(u32),
+    /// Windows Standard Icons
+    WinIDI(PCWSTR),
+    /// Windows Standard Cursors
+    WinIDC(PCWSTR),
     Name(&'a str),
-    #[default]
-    Empty,
 }
-#[derive(Default)]
+
 struct ResourceBuilder<'a, T: Write> {
     flags: IMAGE_FLAGS,
     resource_type: GDI_IMAGE_TYPE,
@@ -37,16 +39,17 @@ struct ResourceBuilder<'a, T: Write> {
     logger: Logger<T>,
 }
 impl<'a, T: Write> ResourceBuilder<'a, T> {
-    fn new(logger: Logger<T>) -> Self {
+    pub fn new(logger: Logger<T>) -> Self {
         Self {
             logger,
             instance: Instance::this(),
             flags: Default::default(),
             resource_type: Default::default(),
             dimensions: Default::default(),
-            name: Default::default(),
+            name: ResourceName::Name(""),
         }
     }
+
     ///  Set the width and height of the icon or image
     ///
     /// No-op for bitmap
@@ -54,24 +57,19 @@ impl<'a, T: Write> ResourceBuilder<'a, T> {
         self.dimensions = (w, h);
         self
     }
+
     /// Use the system default size for the resource
-    fn use_default(&mut self) -> &mut Self {
+    fn use_sysdefault(&mut self) -> &mut Self {
         self.flags = self.flags.bitor(LR_DEFAULTSIZE);
         self
     }
+
     /// Use a DIB section bitmap rather than compatible
     fn use_dib(&mut self) -> &mut Self {
         self.flags = self.flags.bitor(LR_CREATEDIBSECTION);
         self
     }
-    /// Share the image handle with all load instances
-    ///
-    /// Do not use for images with sizes that may change
-    /// after loading or loaded from a file
-    fn make_shared(&mut self) -> &mut Self {
-        self.flags = self.flags.bitor(LR_SHARED);
-        self
-    }
+
     /// Load image with transparency for every pixel matching the first
     /// pixel in image
     ///
@@ -80,6 +78,7 @@ impl<'a, T: Write> ResourceBuilder<'a, T> {
         self.flags = self.flags.bitor(LR_LOADTRANSPARENT);
         self
     }
+
     /// Load image gray shades with 3D respective shades
     ///
     /// Do not use on bitmap with color depth greater than 8bpp
@@ -87,81 +86,208 @@ impl<'a, T: Write> ResourceBuilder<'a, T> {
         self.flags = self.flags.bitor(LR_LOADMAP3DCOLORS);
         self
     }
+
     /// Load image in black and white
     fn use_mono(&mut self) -> &mut Self {
         self.flags = self.flags.bitor(LR_MONOCHROME);
         self
     }
+
     /// Load image with true VGA colors
     fn use_vga(&mut self) -> &mut Self {
         self.flags = self.flags.bitor(LR_VGACOLOR);
         self
     }
-    /// Set the process to control the manager
+
+    /// Set the process to hold the resource
     ///
-    /// Defaults to `this` process if setting is ignored
+    /// Default is `this` process
     fn set_instance(&mut self, module_name: &str) -> &mut Self {
         self.instance = Instance(module_name).get_instance();
         self
     }
+
     /// Set the resource name
+    ///
+    /// `Resource::Name` should end in `BMP`, `ICO`, or `CUR`
+    ///
+    /// `Resource::File` extension should end in `.cur`, `.ico`, or `.bmp`
+    ///
+    /// ## Example
+    /// ```
+    /// let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 2));
+    /// let resource1 = builder.set_name(Resource::Name("TestBMP\0")).load()
+    /// let resource2 = builder.set_name(Resource::File("test.bmp\0")).load()
+    ///
+    /// assert!(resource1.is_some())
+    /// assert!(resource2.is_some())
+    /// ```
     fn set_name(&mut self, name: ResourceName<'a>) -> &mut Self {
         self.name = name;
         self
     }
-    /// Set resource type as icon
-    ///
-    /// The last type to be set will be used
-    fn set_typei(&mut self) -> &mut Self {
-        self.resource_type = IMAGE_ICON;
-        self
-    }
-    /// Set resource type as cursor
-    ///
-    /// The last type to be set will be used
-    fn set_typec(&mut self) -> &mut Self {
-        self.resource_type = IMAGE_CURSOR;
-        self
-    }
-    /// Set resource type as bitmap
-    ///
-    /// The last type to be set will be used
-    fn set_typeb(&mut self) -> &mut Self {
-        self.resource_type = IMAGE_BITMAP;
-        self
-    }
-    /// Convert stored `ResourceName` -> PCSTR
+
+    /// Convert stored `ResourceName` to PCSTR
     fn name_as_pcstr(&mut self) -> Option<PCSTR> {
         let name = match self.name {
-            ResourceName::FilePath(path) => {
-                if let Some(path) = path.to_str() {
-                    Some(PCSTR(path.as_ptr()))
+            ResourceName::File(file) => {
+                if !file.is_empty() {
+                    if file.ends_with('\0') {
+                        let path = Path::new(file.trim_end_matches('\0'));
+                        if let Some(ext) = path.extension() {
+                            let ext = ext.to_string_lossy();
+                            match ext {
+                                Cow::Borrowed("cur") => self.resource_type = IMAGE_CURSOR,
+                                Cow::Borrowed("ico") => self.resource_type = IMAGE_ICON,
+                                Cow::Borrowed("bmp") => self.resource_type = IMAGE_BITMAP,
+                                _ => {
+                                    self.logger.elogln(
+                                        format!(
+                                        "ResourceBuilder::name_as_pcstr() File extension is not valid: .{}",
+                                        ext
+                                    )
+                                        .as_str(),
+                                    );
+                                    return None;
+                                }
+                            }
+                        } else {
+                            self.logger
+                                .elogln("ResourceBuilder::name_as_pcstr() No file extension");
+                            return None;
+                        }
+
+                        let path_string = path.to_string_lossy();
+                        if !path_string.contains("�") {
+                            if metadata(path).is_ok() {
+                                Some(PCSTR(file.as_ptr()))
+                            } else {
+                                self.logger.elogln(
+                                    format!(
+                                        "ResourceBuilder::name_as_pcstr() File does not exist: {}",
+                                        path_string
+                                    )
+                                    .as_str(),
+                                );
+                                None
+                            }
+                        } else {
+                            self.logger.elogln(
+                                format!(
+                                    "ResourceBuilder::name_as_pcstr() File should not have invalid Unicode: {}",
+                                    path_string
+                                )
+                                .as_str(),
+                            );
+                            None
+                        }
+                    } else {
+                        self.logger.elogln(
+                            format!(
+                                r"ResourceBuilder::name_as_pcstr\(\) Filename needs to end in '\0': {} \n",
+                                file
+                            )
+                            .as_str(),
+                        );
+                        None
+                    }
                 } else {
                     self.logger
-                        .elogln("ResourceBuilder::name_as_pcstr() File could not be found");
+                        .elogln("ResourceBuilder::name_as_pcstr() Filename can not be empty");
                     None
                 }
             }
+            ResourceName::WinOIC(id) => {
+                self.resource_type = IMAGE_ICON;
+                self.flags = self.flags.bitor(LR_SHARED);
+                self.instance = Default::default();
 
-            ResourceName::WinOEM(id) => Some(PCSTR(id as *const u8)),
-            ResourceName::WinIC(id) => Some(PCSTR(id.0 as *const u8)),
-            ResourceName::Name(name) => {
-                self.logger
-                    .elogln("ResourceBuilder::name_as_pcstr() Name can not be empty");
-                Some(PCSTR(name.as_ptr()))
+                Some(PCSTR(id as *const u8))
             }
-            ResourceName::Empty => {
-                self.logger
-                    .elogln("ResourceBuilder::name_as_pcstr() Resource name is empty");
-                None
+            ResourceName::WinOCR(id) => {
+                self.resource_type = IMAGE_CURSOR;
+                self.flags = self.flags.bitor(LR_SHARED);
+                self.instance = Default::default();
+
+                let res = match id {
+                    32641u32 => None,
+                    32647u32 => None,
+                    32640u32 => None,
+                    _ => Some(PCSTR(id as *const u8)),
+                };
+
+                if res.is_none() {
+                    self.logger
+                        .elogln("ResourceBuilder::name_as_pcstr() OCR_NO, OCR_SIZE, and OCR_ICOCUR are no-op with ResourceName::WinOCR");
+                }
+
+                res
+            }
+            ResourceName::WinOBM(id) => {
+                self.resource_type = IMAGE_BITMAP;
+                self.flags = self.flags.bitor(LR_SHARED);
+                self.instance = Default::default();
+
+                Some(PCSTR(id as *const u8))
+            }
+            ResourceName::WinIDC(id) => {
+                self.resource_type = IMAGE_CURSOR;
+                self.flags = self.flags.bitor(LR_SHARED);
+                self.instance = Default::default();
+
+                Some(PCSTR(id.0 as *const u8))
+            }
+            ResourceName::WinIDI(id) => {
+                self.resource_type = IMAGE_ICON;
+                self.flags = self.flags.bitor(LR_SHARED);
+                self.instance = Default::default();
+
+                Some(PCSTR(id.0 as *const u8))
+            }
+            ResourceName::Name(name) => {
+                if !name.is_empty() {
+                    if name.ends_with('\0') {
+                        match name.to_uppercase() {
+                            n if n.contains("BMP") => self.resource_type = IMAGE_BITMAP,
+                            n if n.contains("CUR") => self.resource_type = IMAGE_CURSOR,
+                            n if n.contains("ICO") => self.resource_type = IMAGE_ICON,
+                            _ => {
+                                self.logger.elogln(
+                                    format!(
+                                        "ResourceBuilder::name_as_pcstr() Name is invalid: {}",
+                                        name
+                                    )
+                                    .as_str(),
+                                );
+                                return None;
+                            }
+                        };
+                        Some(PCSTR(name.as_ptr()))
+                    } else {
+                        self.logger.elogln(
+                            format!(
+                                r"ResourceBuilder::name_as_pcstr() Name needs to end in '\0': {}",
+                                name
+                            )
+                            .as_str(),
+                        );
+                        None
+                    }
+                } else {
+                    self.logger
+                        .elogln("ResourceBuilder::name_as_pcstr() Name can not be empty");
+                    None
+                }
             }
         };
         name
     }
+
     /// Check if flag is set
     fn is_flag(&self, flag: IMAGE_FLAGS) -> bool {
         self.flags.0.bitand(flag.0) == flag.0
     }
+
     /// Validate builder settings
     fn validator(&mut self) {
         // Dimensions
@@ -190,23 +316,21 @@ impl<'a, T: Write> ResourceBuilder<'a, T> {
         check_dimensions(width, "width");
         check_dimensions(height, "height");
         // Bitmap
-        if self.resource_type != IMAGE_BITMAP {
-            let rtype;
+        if self.is_flag(LR_CREATEDIBSECTION) {
             match self.resource_type {
-                IMAGE_CURSOR => rtype = "IMAGE_CURSOR",
-                IMAGE_ICON => rtype = "IMAGE_ICON",
-                _ => rtype = "UNKNOWN",
-            }
-            self.logger.wlogln(
-                format!("ResourceBuilder::validator() DIB section bitmap is no-op with resource type: '{}'",
-                rtype).as_str(),
-            )
-        }
-        // Handles
-        if !self.is_flag(LR_SHARED) {
-            match self.name {
-                ResourceName::WinOEM(_) | ResourceName::WinIC(_) => self.logger.elogln("ResourceBuilder::validator() Windows icons, cursors, and bitmaps must be shared"),
-                _ => ()
+                IMAGE_CURSOR => {
+                    self.logger.wlogln(
+                        format!("ResourceBuilder::validator() DIB section bitmap is no-op with resource type: 'IMAGE_CURSOR'"
+                        ).as_str(),
+                    )
+                }
+                IMAGE_ICON => {
+                    self.logger.wlogln(
+                        format!("ResourceBuilder::validator() DIB section bitmap is no-op with resource type: 'IMAGE_ICON'"
+                        ).as_str(),
+                    )
+                }
+                _ => (),
             }
         }
         // Color
@@ -218,8 +342,18 @@ impl<'a, T: Write> ResourceBuilder<'a, T> {
             }
         }
     }
+
     fn load(&mut self) -> Option<Resource> {
+        match self.name {
+            ResourceName::File(_) => {
+                self.flags = self.flags.bitor(LR_LOADFROMFILE);
+            }
+            _ => (),
+        }
+
         if let Some(name) = self.name_as_pcstr() {
+            self.validator();
+
             let handle = unsafe {
                 LoadImageA(
                     self.instance,
@@ -231,6 +365,7 @@ impl<'a, T: Write> ResourceBuilder<'a, T> {
                 )
             }
             .ok();
+
             if let Some(handle) = handle {
                 Some(Resource::new(handle))
             } else {
@@ -242,16 +377,45 @@ impl<'a, T: Write> ResourceBuilder<'a, T> {
             None
         }
     }
-    // Load resource from a file path
-    fn load_file(&mut self) -> Option<Resource> {
+
+    fn load_icon(&mut self) -> Option<HICON> {
         match self.name {
-            ResourceName::FilePath(_) => {
-                self.flags = self.flags.bitor(LR_LOADFROMFILE);
-                self.load()
+            ResourceName::WinIDI(_) | ResourceName::WinOIC(_) => {
+                let name = self.name_as_pcstr().unwrap_or(PCSTR::null());
+                if let Some(handle) = unsafe { LoadIconA(self.instance, name) }.ok() {
+                    Some(handle)
+                } else {
+                    self.logger.elogln(
+                        "ResourceBuilder::load_icon() Failed to create a handle for the icon",
+                    );
+                    None
+                }
             }
             _ => {
                 self.logger.elogln(
-                    "ResourceBuilder::load_file() ResourceName::FilePath variance must be used",
+                    "ResourceBuilder::load_icon() 'ResourceName::WinIDI' or 'ResourceName::WinOIC' should be used",
+                );
+                None
+            }
+        }
+    }
+
+    fn load_cursor(&mut self) -> Option<HCURSOR> {
+        match self.name {
+            ResourceName::WinIDC(_) | ResourceName::WinOCR(_) => {
+                let name = self.name_as_pcstr().unwrap_or(PCSTR::null());
+                if let Some(handle) = unsafe { LoadCursorA(self.instance, name) }.ok() {
+                    Some(handle)
+                } else {
+                    self.logger.elogln(
+                        "ResourceBuilder::load_cursor() Failed to create a handle for the cursor",
+                    );
+                    None
+                }
+            }
+            _ => {
+                self.logger.elogln(
+                    "ResourceBuilder::load_cursor() 'ResourceName::WinIDC' or 'ResourceName::WinOCR' should be used",
                 );
                 None
             }
@@ -271,49 +435,586 @@ impl Resource {
 mod resource_builder_tests {
     use super::*;
     use regex::Regex;
-    #[test]
-    fn test_name_as_pcstr_is_empty() {
-        let mut buffer = Vec::new();
-        let logger = Logger::new(&mut buffer, 3);
-        let mut builder = ResourceBuilder::new(logger);
-        let resource = builder.set_name(ResourceName::Empty).load();
-        let log_re = Regex::new(
-          r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::name_as_pcstr\(\) Resource name is empty\n",
-      )
-      .unwrap();
-        let log = String::from_utf8_lossy(&buffer);
 
-        assert!(log_re.is_match(&log));
-        assert!(resource.is_none());
+    fn assert_log(expected: &str, actual: &Vec<u8>) {
+        match Regex::new(expected) {
+            Ok(r) => assert!(r.is_match(&String::from_utf8_lossy(actual))),
+            Err(e) => println!("{}", e),
+        }
     }
-    #[test]
-    fn test_name_as_pcstr_is_empty_str() {
-        let mut buffer = Vec::new();
-        let logger = Logger::new(&mut buffer, 3);
-        let mut builder = ResourceBuilder::new(logger);
-        let resource = builder.set_name(ResourceName::Name("")).load();
-        let log_re = Regex::new(
-            r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::name_as_pcstr\(\) Name can not be empty\n",
-        )
-        .unwrap();
-        let log = String::from_utf8_lossy(&buffer);
-
-        assert!(log_re.is_match(&log))
+    fn assert_log_cnt(expected: &str, actual: &Vec<u8>, count: usize) {
+        match Regex::new(expected) {
+            Ok(r) => assert!(r.find_iter(&String::from_utf8_lossy(actual)).count() == count),
+            Err(e) => println!("{}", e),
+        }
     }
-    // #[test]
-    // fn test_name_as_pcstr_is_file_not_found() {
-    //     let mut buffer = Vec::new();
-    //     let logger = Logger::new(&mut buffer, 3);
-    //     let mut builder = ResourceBuilder::new(logger);
-    //     let resource = builder
-    //         .set_name(ResourceName::FilePath(&Path::new("foo.txt")))
-    //         .load();
-    //     let log_re = Regex::new(
-    //         r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::name_as_pcstr\(\) File could not be found\n",
-    //     )
-    //     .unwrap();
-    //     let log = String::from_utf8_lossy(&buffer);
 
-    //     assert!(log_re.is_match(&log))
-    // }
+    mod load_tests {
+        use super::*;
+
+        #[test]
+        fn test_load_cursor() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let cursor1 = builder
+                .set_name(ResourceName::WinOCR(OCR_CROSS.0))
+                .load_cursor();
+            let cursor2 = builder
+                .set_name(ResourceName::WinIDC(IDC_CROSS))
+                .load_cursor();
+
+            assert!(&buffer.is_empty());
+            assert!(cursor1.is_some());
+            assert!(cursor2.is_some());
+        }
+
+        #[test]
+        fn test_load_cursor_failed() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let cursor1 = builder
+                .set_name(ResourceName::WinIDC(PCWSTR(7821 as *const u16)))
+                .load_cursor();
+            let cursor2 = builder.set_name(ResourceName::WinOCR(7821)).load_cursor();
+
+            assert_log_cnt(
+                r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::load_cursor\(\) Failed to create a handle for the cursor\n",
+                &buffer,
+                2,
+            );
+            assert!(cursor1.is_none());
+            assert!(cursor2.is_none());
+        }
+
+        #[test]
+        fn test_load_cursor_incompatible_name() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let cursor1 = builder
+                .set_name(ResourceName::Name("TestBMP\0"))
+                .load_cursor();
+            let cursor2 = builder
+                .set_name(ResourceName::File("test.bmp\0"))
+                .load_cursor();
+            let cursor3 = builder
+                .set_name(ResourceName::WinOBM(OBM_BTNCORNERS))
+                .load_cursor();
+            let cursor4 = builder
+                .set_name(ResourceName::WinOIC(OIC_HAND))
+                .load_cursor();
+            let cursor5 = builder
+                .set_name(ResourceName::WinIDI(IDI_EXCLAMATION))
+                .load_cursor();
+
+            assert_log_cnt(
+                r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::load_cursor\(\) 'ResourceName::WinIDC' or 'ResourceName::WinOCR' should be used\n",
+                &buffer,
+                5,
+            );
+            assert!(cursor1.is_none());
+            assert!(cursor2.is_none());
+            assert!(cursor3.is_none());
+            assert!(cursor4.is_none());
+            assert!(cursor5.is_none());
+        }
+
+        #[test]
+        fn test_load_icon() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let icon1 = builder
+                .set_name(ResourceName::WinIDI(IDI_APPLICATION))
+                .load_icon();
+            let icon2 = builder.set_name(ResourceName::WinOIC(OIC_HAND)).load_icon();
+
+            assert!(&buffer.is_empty());
+            assert!(icon1.is_some());
+            assert!(icon2.is_some());
+        }
+
+        #[test]
+        fn test_load_icon_failed() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let icon1 = builder
+                .set_name(ResourceName::WinIDI(PCWSTR(7821 as *const u16)))
+                .load_icon();
+            let icon2 = builder.set_name(ResourceName::WinOIC(7821)).load_icon();
+
+            assert_log_cnt(
+                r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::load_icon\(\) Failed to create a handle for the icon\n",
+                &buffer,
+                2,
+            );
+            assert!(icon1.is_none());
+            assert!(icon2.is_none());
+        }
+
+        #[test]
+        fn test_load_icon_incompatible_name() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let icon1 = builder
+                .set_name(ResourceName::Name("TestBMP\0"))
+                .load_icon();
+            let icon2 = builder
+                .set_name(ResourceName::File("test.bmp\0"))
+                .load_icon();
+            let icon3 = builder
+                .set_name(ResourceName::WinOBM(OBM_BTNCORNERS))
+                .load_icon();
+            let icon4 = builder
+                .set_name(ResourceName::WinOCR(OCR_APPSTARTING.0))
+                .load_icon();
+            let icon5 = builder
+                .set_name(ResourceName::WinIDC(IDC_APPSTARTING))
+                .load_icon();
+
+            assert_log_cnt(
+                r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::load_icon\(\) 'ResourceName::WinIDI' or 'ResourceName::WinOIC' should be used\n",
+                &buffer,
+                5,
+            );
+            assert!(icon1.is_none());
+            assert!(icon2.is_none());
+            assert!(icon3.is_none());
+            assert!(icon4.is_none());
+            assert!(icon5.is_none());
+        }
+
+        #[test]
+        fn test_load_failed() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let resource = builder.set_name(ResourceName::Name("TestTestBMP\0")).load();
+
+            assert_log(
+                r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::load\(\) Failed to create a handle for the resource",
+                &buffer,
+            );
+            assert!(resource.is_none())
+        }
+    }
+
+    mod flags_tests {
+        use super::*;
+
+        #[test]
+        fn test_use_dimensions() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            builder.set_dimensions(10, 10);
+
+            assert_eq!(builder.dimensions, (10, 10))
+        }
+
+        #[test]
+        fn test_use_transparent() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            builder.use_transparent();
+
+            assert_eq!(builder.flags, LR_LOADTRANSPARENT)
+        }
+
+        #[test]
+        fn test_use_sysdefault() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            builder.use_sysdefault();
+
+            assert_eq!(builder.flags, LR_DEFAULTSIZE)
+        }
+
+        #[test]
+        fn test_use_dib() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            builder.use_dib();
+
+            assert_eq!(builder.flags, LR_CREATEDIBSECTION)
+        }
+
+        #[test]
+        fn test_use_vga() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            builder.use_vga();
+
+            assert_eq!(builder.flags, LR_VGACOLOR)
+        }
+
+        #[test]
+        fn test_use_3d() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            builder.use_3d();
+
+            assert_eq!(builder.flags, LR_LOADMAP3DCOLORS)
+        }
+
+        #[test]
+        fn test_use_mono() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            builder.use_mono();
+
+            assert_eq!(builder.flags, LR_MONOCHROME)
+        }
+    }
+
+    mod name_as_pcstr_test {
+        use super::*;
+
+        #[test]
+        fn test_load() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let resource = builder.set_name(ResourceName::Name("TestTestBMP\0")).load();
+
+            assert_log(
+                r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::load\(\) Failed to create a handle for the resource",
+                &buffer,
+            );
+            assert!(resource.is_none())
+        }
+
+        #[test]
+        fn test_name_as_pcstr_is_not_valid_name() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let resource = builder.set_name(ResourceName::Name("Test\0")).load();
+
+            assert_log(
+                r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::name_as_pcstr\(\) Name is invalid: Test",
+                &buffer,
+            );
+            assert!(resource.is_none())
+        }
+
+        #[test]
+        fn test_name_as_pcstr_is_valid_name() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let resource1 = builder.set_name(ResourceName::Name("TestBMP\0")).load();
+            let resource2 = builder.set_name(ResourceName::Name("TestCUR\0")).load();
+            let resource3 = builder.set_name(ResourceName::Name("TestICO\0")).load();
+            assert!(&buffer.is_empty());
+            assert!(resource1.is_some());
+            assert!(resource2.is_some());
+            assert!(resource3.is_some());
+        }
+
+        #[test]
+        fn test_name_as_pcstr_name_not_null_terminating() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let resource: Option<Resource> = builder.set_name(ResourceName::Name("test")).load();
+
+            assert_log(
+                r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::name_as_pcstr\(\) Name needs to end in '\0': foot.txt\n",
+                &buffer,
+            );
+            assert!(resource.is_none())
+        }
+
+        #[test]
+        fn test_name_as_pcstr_name_empty() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 3));
+            let resource = builder.set_name(ResourceName::Name("")).load();
+
+            assert_log(
+                r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::name_as_pcstr\(\) Name can not be empty\n",
+                &buffer,
+            );
+            assert!(resource.is_none());
+        }
+
+        #[test]
+        fn test_name_as_pcstr_is_valid_file_extension() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let resource1: Option<Resource> = builder
+                .set_name(ResourceName::File("tests\\resources\\sample.ico\0"))
+                .load();
+            let resource2 = builder
+                .set_name(ResourceName::File("tests\\resources\\sample.cur\0"))
+                .load();
+            let resource3 = builder
+                .set_name(ResourceName::File("tests\\resources\\sample.bmp\0"))
+                .load();
+
+            assert!(&buffer.is_empty());
+            assert!(resource1.is_some());
+            assert!(resource2.is_some());
+            assert!(resource3.is_some());
+        }
+
+        #[test]
+        fn test_name_as_pcstr_file_empty() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let resource: Option<Resource> = builder.set_name(ResourceName::File("")).load();
+
+            assert_log(
+                r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::name_as_pcstr\(\) Filename can not be empty\n",
+                &buffer,
+            );
+            assert!(resource.is_none())
+        }
+
+        #[test]
+        fn test_name_as_pcstr_file_not_null_terminating() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let resource: Option<Resource> = builder.set_name(ResourceName::File("foo.txt")).load();
+
+            assert_log(
+                r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::name_as_pcstr\(\) Filename needs to end in '\0': foot.txt\n",
+                &buffer,
+            );
+            assert!(resource.is_none())
+        }
+
+        #[test]
+        fn test_name_as_pcstr_is_not_vaild_file_extension() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let resource: Option<Resource> =
+                builder.set_name(ResourceName::File("foo.txt\0")).load();
+
+            assert_log(
+                r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::name_as_pcstr\(\) File extension is not valid: .txt\n",
+                &buffer,
+            );
+            assert!(resource.is_none())
+        }
+
+        #[test]
+        fn test_name_as_pcstr_no_file_extension() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let resource: Option<Resource> = builder.set_name(ResourceName::File("foo\0")).load();
+
+            assert_log(
+                r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::name_as_pcstr\(\) No file extension\n",
+                &buffer,
+            );
+            assert!(resource.is_none())
+        }
+
+        #[test]
+        fn test_name_as_pcstr_file_does_not_exist() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let resource: Option<Resource> =
+                builder.set_name(ResourceName::File("foo.bmp\0")).load();
+
+            assert_log(
+                r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::name_as_pcstr\(\) File does not exist: foo.bmp\n",
+                &buffer,
+            );
+            assert!(resource.is_none())
+        }
+
+        #[test]
+        fn test_name_as_pcstr_invaild_unicode() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let resource = builder.set_name(ResourceName::File("foo�.bmp\0")).load();
+
+            assert_log(
+                r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::name_as_pcstr\(\) File should not have invalid Unicode: foo�.bmp\n",
+                &buffer,
+            );
+            assert!(resource.is_none())
+        }
+
+        #[test]
+        fn test_name_as_pcstr_win_resources() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let resource1 = builder.set_name(ResourceName::WinIDC(IDC_ARROW)).load();
+            let resource2 = builder.set_name(ResourceName::WinIDI(IDC_ARROW)).load();
+            let resource3 = builder.set_name(ResourceName::WinOBM(OBM_CHECK)).load();
+            let resource4 = builder.set_name(ResourceName::WinOCR(OCR_NO.0)).load();
+            let resource5 = builder.set_name(ResourceName::WinOIC(OIC_BANG)).load();
+
+            assert!(&buffer.is_empty());
+            assert!(resource1.is_some());
+            assert!(resource2.is_some());
+            assert!(resource3.is_some());
+            assert!(resource4.is_some());
+            assert!(resource5.is_some());
+        }
+
+        #[test]
+        fn test_name_as_pcstr_win_cursors_no_op() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 1));
+            let resource1 = builder.set_name(ResourceName::WinOCR(OCR_ICOCUR)).load();
+            let resource2 = builder.set_name(ResourceName::WinOCR(OCR_SIZE)).load();
+            let resource3 = builder.set_name(ResourceName::WinOCR(OCR_ICON)).load();
+
+            assert_log(
+                r"\[ERROR\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::name_as_pcstr\(\) OCR_NO, OCR_SIZE, and OCR_ICOCUR are no-op with ResourceName::WinOCR\n",
+                &buffer,
+            );
+            assert!(resource1.is_none());
+            assert!(resource2.is_none());
+            assert!(resource3.is_none());
+        }
+    }
+
+    mod validator_tests {
+        use super::*;
+
+        #[test]
+        fn test_validator_use_orginal_dimensions() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 2));
+            let resource = builder.set_name(ResourceName::WinIDI(IDI_ERROR)).load();
+
+            assert_log(
+                r"\[WARNING\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::validator\(\) The original image height will be used\n",
+                &buffer,
+            );
+            assert_log(
+                r"\[WARNING\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::validator\(\) The original image width will be used\n",
+                &buffer,
+            );
+            assert!(resource.is_some());
+        }
+
+        #[test]
+        fn test_validator_use_system_dimensions() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 2));
+            let resource = builder
+                .use_sysdefault()
+                .set_name(ResourceName::WinIDI(IDI_APPLICATION))
+                .load();
+
+            assert_log(
+                r"\[WARNING\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::validator\(\) The default system height will be used\n",
+                &buffer,
+            );
+            assert_log(
+                r"\[WARNING\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::validator\(\) The default system width will be used\n",
+                &buffer,
+            );
+            assert!(resource.is_some());
+        }
+
+        #[test]
+        fn test_validator_no_op_dib() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 2));
+            let resource1 = builder
+                .set_name(ResourceName::WinIDI(IDI_EXCLAMATION))
+                .use_dib()
+                .load();
+            let resource2 = builder
+                .set_name(ResourceName::WinIDC(IDC_APPSTARTING))
+                .use_dib()
+                .load();
+
+            assert_log(
+                r"\[WARNING\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::validator\(\) DIB section bitmap is no-op with resource type: 'IMAGE_ICON'\n",
+                &buffer,
+            );
+            assert_log(
+                r"\[WARNING\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::validator\(\) DIB section bitmap is no-op with resource type: 'IMAGE_CURSOR'\n",
+                &buffer,
+            );
+            assert!(resource1.is_some());
+            assert!(resource2.is_some());
+        }
+
+        #[test]
+        fn test_validator_use_dib() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 2));
+            let resource = builder
+                .set_name(ResourceName::WinOBM(OBM_CHECKBOXES))
+                .set_dimensions(10, 10)
+                .use_dib()
+                .load();
+
+            assert!(resource.is_some());
+            assert!(&buffer.is_empty());
+        }
+
+        #[test]
+        fn test_validator_no_op_3d_or_vga() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 2));
+            let resource = builder
+                .set_name(ResourceName::WinIDC(IDC_HAND))
+                .use_3d()
+                .use_mono()
+                .load();
+
+            assert_log(
+                r"\[WARNING\] \d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}.\d{1,3}: ResourceBuilder::validator\(\) 3D and VGA color are no-op when mono is used\n",
+                &buffer,
+            );
+            assert!(resource.is_some());
+        }
+
+        #[test]
+        fn test_validator_use_3d_or_vga() {
+            let mut buffer = Vec::new();
+
+            let mut builder = ResourceBuilder::new(Logger::new(&mut buffer, 2));
+            let resource1 = builder
+                .set_name(ResourceName::WinIDI(IDI_EXCLAMATION))
+                .set_dimensions(10, 10)
+                .use_3d()
+                .load();
+            let resource2: Option<Resource> = builder
+                .set_name(ResourceName::WinOBM(OBM_BTSIZE))
+                .set_dimensions(10, 10)
+                .use_vga()
+                .load();
+
+            assert!(&buffer.is_empty());
+            assert!(resource1.is_some());
+            assert!(resource2.is_some());
+        }
+    }
 }
