@@ -1,0 +1,3 @@
+TestBMP BITMAP "tests/resources/sample.bmp"
+TestICO ICON "tests/resources/sample.ico"
+TestCUR CURSOR "tests/resources/sample.cur"
